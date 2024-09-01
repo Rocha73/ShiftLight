@@ -1,0 +1,351 @@
+/*Nome ALUNO A- André Rocha
+IPLEIRIA - Instituto Politécnico de Leiria
+ESTG - Escola Superior de Tecnologia e Gestão
+LEAU- Licenciatura em Engenharia Automóvel
+SEEV - Sistemas Elétricos e Eletrónicos de Veículos
+
+O presente codigo serve para implementar um sistema de Shift Lights. 
+os botões Shift Up e Shift Down servem para
+alterar o valor de uma variável para posteriormente ser apresentado no TFT. 
+O botão Drive Mode por sua vez influência o valor de PWM para acender os LEDS e 
+apresenta no TFT qual o modo de condução em execução. 
+O potenciómetro altera o valor de PWM que acende os LEDS e alimenta o motor DC.
+Porém, a rotação do motor DC é lida pelo sensor LM393 e posteriormente 
+o seu valor é enviado para ser apresentado no TFT.
+LINKs: GitHub: 
+       Youtube:  
+*/-------------------------------------
+#include "Arduino.h"
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+//Bibliotecas para LCD:
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <ezButton.h>
+
+#define LED1 5
+#define LED2 2
+#define LED3 0
+#define LED4 4
+#define LED5 17
+#define LED6 33
+#define pot_pin 34
+#define enA 27
+#define in1 13
+#define in2 12
+#define Pino_Sensor 35
+#define TFT_CS 15
+#define TFT_DC 26
+#define TFT_MOSI 23
+#define TFT_MISO 19
+#define TFT_SCLK 18
+#define TFT_RST -1  // ligar ao 3V3
+ezButton button1(16);
+ezButton button2(21);
+ezButton button3(32);
+
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK,
+                                        TFT_RST, TFT_MISO);
+
+void motorcontrol(void *pvParameters);
+void vTask_Sensor(void *pvParameters);
+void vTask_TFT(void *pvParameters);
+void shiftmaisemenos(void *pvParameters);
+void drivemode(void *pvParameters);
+void Leds(void *pvParameters);
+void Int_Contador(void);
+//Declaração variável do semáfero:
+SemaphoreHandle_t xCountingSemaphore;
+SemaphoreHandle_t xMutex;
+
+//Declaração de variáveis de Queues:
+QueueHandle_t xQueueRPM;
+QueueHandle_t xQueueSHIFT;
+QueueHandle_t xQueueMODE;
+QueueHandle_t xQueuePWM;
+
+void setup() {
+  vTaskPrioritySet(NULL, configMAX_PRIORITIES - 1);  //Define o setup como prioridade maxima
+  pinMode(LED1, OUTPUT);
+  pinMode(LED2, OUTPUT);
+  pinMode(LED3, OUTPUT);
+  pinMode(LED4, OUTPUT);
+  pinMode(LED5, OUTPUT);
+  pinMode(LED6, OUTPUT);
+  pinMode(enA, OUTPUT);
+  pinMode(in2, OUTPUT);
+  Serial.begin(115200);
+  button1.setDebounceTime(50);  // set debounce time to 50 milliseconds
+  button2.setDebounceTime(50);  // set debounce time to 50 milliseconds
+  button3.setDebounceTime(50);  // set debounce time to 50 milliseconds
+                                //Configuração do pino de entrada sensor infra-vermelho:
+  pinMode(Pino_Sensor, INPUT);
+  //Criação Interrrupção:
+  attachInterrupt(Pino_Sensor, Int_Contador, RISING);
+
+  //Criação de Queues:
+  xQueueRPM = xQueueCreate(1, sizeof(int));
+  xQueueSHIFT = xQueueCreate(1, sizeof(int));
+  xQueueMODE = xQueueCreate(1, sizeof(int));
+  xQueuePWM = xQueueCreate(1, sizeof(int));
+
+  //Criação semáfero contador:
+  xCountingSemaphore = xSemaphoreCreateCounting(4000, 0);
+
+  //Criação Mutex:
+  xMutex = xSemaphoreCreateMutex();
+
+  //Criação das tarefas:
+  if (xCountingSemaphore != NULL) {
+
+    xTaskCreatePinnedToCore(vTask_Sensor, "Task Sensor", 2000, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(motorcontrol, "controlo motor", 1024, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(vTask_TFT, "Task TFT", 2000, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(shiftmaisemenos, "Shiftupanddown", 2000, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(drivemode, "modoConducao", 2000, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(Leds, "LEDS", 2000, NULL, 1, NULL, 1);
+  }
+}
+//----------------------------------------------------------------------
+void motorcontrol(void *pvParameters) {
+  for (;;) {
+    int potvalue = analogRead(pot_pin);
+    int pwm = map(potvalue, 0, 4095, 0, 255);
+    analogWrite(enA, pwm);
+    digitalWrite(in2, HIGH);
+    //Serial.println(pwm);
+    vTaskDelay((10 / portTICK_PERIOD_MS));
+    xQueueOverwrite(xQueuePWM, &pwm);
+  }
+}
+//--------------------------------------------------------------------------
+void Int_Contador(void) {
+
+  portBASE_TYPE xHigherPriorityTaskWoken;
+  xHigherPriorityTaskWoken = pdFALSE;
+
+  xSemaphoreGiveFromISR(xCountingSemaphore, &xHigherPriorityTaskWoken);
+
+  if (xHigherPriorityTaskWoken == pdTRUE) {
+    portYIELD_FROM_ISR();
+  }
+}
+//--------------------------------------------------------------------------------------------
+void vTask_Sensor(void *pvParameters) {
+
+  int pulsos = 0;
+  int rpm = 0;
+
+  unsigned long timeold = 0;
+
+  for (;;) {
+    //Recebe a contagem dos pulsos feita pelo semáforo
+    pulsos += uxSemaphoreGetCount(xCountingSemaphore);
+
+    if (millis() - timeold >= 1000) {
+
+      //Realização do cálculo dos RPM:
+      rpm = (60 * 1000 / 4) / (millis() - timeold) * pulsos;
+      timeold = millis();
+
+      //Guarda os valores dos RPM
+      xQueueOverwrite(xQueueRPM, &rpm);
+
+      pulsos = 0;
+    }
+
+    xQueueReset(xCountingSemaphore);
+  }
+  //--------------------------------------------------------------------
+}
+void shiftmaisemenos(void *pvParameters) {
+  int cont = 0;
+  long pwm, mode;
+  for (;;) {
+    xQueuePeek(xQueuePWM, &pwm, 0);
+    xQueuePeek(xQueueMODE, &mode, 0);
+
+    button1.loop();  // MUST call the loop() function first
+    button2.loop();  // MUST call the loop() function first
+
+
+
+    if (mode == 1 && pwm >= 230 || mode == 0 && pwm >= 50) {
+    if (button1.isPressed()) {
+
+      cont++;
+
+      if (cont > 6) {
+        cont = 6;
+      }
+      Serial.println(cont);
+      xQueueOverwrite(xQueueSHIFT, &cont);
+    }
+    }
+    if (mode == 1 && pwm <= 50 || mode == 0 && pwm <= 10) {
+    if (button2.isPressed()) {
+
+      cont--;
+
+      if (cont < 0) {
+        cont = 0;
+      }
+      Serial.println(cont);
+      xQueueOverwrite(xQueueSHIFT, &cont);
+      if (cont == 0) {
+        Serial.println("N");
+      }
+    }
+  }
+}
+}
+//-----------------------------------------------------------
+void drivemode(void *pvParameters) {
+  int mode = 0;
+  long pwm;
+  for (;;) {
+
+    xQueuePeek(xQueuePWM, &pwm, 0);
+
+    button3.loop();  // MUST call the loop() function first
+
+
+    if (pwm <= 50) {
+      if (button3.isPressed()) {
+
+        mode++;
+
+        if (mode > 1) {
+          mode = 0;
+        }
+      }
+    }
+
+    xQueueOverwrite(xQueueMODE, &mode);
+  }
+}
+//---------------------------------------------------------------------
+void Leds(void *pvParameters) {
+  long pwm, mode;
+  for (;;) {
+
+    xQueuePeek(xQueuePWM, &pwm, 0);
+    xQueuePeek(xQueueMODE, &mode, 0);
+    if (pwm >= 2) {
+      digitalWrite(LED1, HIGH);
+    } else {
+      digitalWrite(LED1, LOW);
+    }
+
+    if (mode == 1 && pwm >= 50 || mode == 0 && pwm >= 10) {
+      digitalWrite(LED2, HIGH);
+    } else {
+      digitalWrite(LED2, LOW);
+    }
+
+    if (mode == 1 && pwm >= 100 || mode == 0 && pwm >= 25) {
+      digitalWrite(LED3, HIGH);
+    } else {
+      digitalWrite(LED3, LOW);
+    }
+
+    if (mode == 1 && pwm >= 150 || mode == 0 && pwm >= 33) {
+      digitalWrite(LED4, HIGH);
+    } else {
+      digitalWrite(LED4, LOW);
+    }
+
+    if (mode == 1 && pwm >= 200 || mode == 0 && pwm >= 42) {
+      digitalWrite(LED5, HIGH);
+    } else {
+      digitalWrite(LED5, LOW);
+    }
+
+    if (mode == 1 && pwm >= 230 || mode == 0 && pwm >= 50) {
+      digitalWrite(LED6, HIGH);
+    } else {
+      digitalWrite(LED6, LOW);
+    }
+  }
+}
+//---------------------------------------------------------------------
+void vTask_TFT(void *pvParameters) {
+
+
+
+  long Display_RPM, shift, mode;
+
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+
+  // Inicializar o tft
+  tft.begin();
+  // Colocar fundo preto
+  tft.fillScreen(ILI9341_BLACK);
+  // Definir orientação da escrita
+  tft.setRotation(2);
+
+  // Desenhar/escrever conteúdos fixos:
+  // Escrever header com nome da unidade curricular e ano
+  tft.setCursor(0, 10);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(2);
+  tft.println(" SEEV ");
+  tft.println(" Shift Lights ");
+  tft.println("     2023/2024      ");
+
+  // Desenhar retangulo em torno do texto escrito
+  tft.drawRect(5, 5, 230, 90, ILI9341_RED);
+  tft.drawRect(6, 6, 228, 88, ILI9341_RED);  //Aumentar espessura
+
+  tft.setCursor(55, 112);
+  tft.println("ROTACAO");
+
+  tft.setCursor(55, 162);
+  tft.println("MUDANCA");
+
+  tft.setCursor(55, 232);
+  tft.println("MODO");
+
+  vTaskDelayUntil(&xLastWakeTime, (1000 / portTICK_PERIOD_MS));
+  for (;;) {
+
+
+    xQueuePeek(xQueueRPM, &Display_RPM, 0);
+    xQueuePeek(xQueueSHIFT, &shift, 0);
+    xQueuePeek(xQueueMODE, &mode, 0);
+
+
+    tft.setCursor(55, 132);
+    tft.print(Display_RPM);
+    tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+    tft.print("     ");
+
+    if (shift == 0) {
+      tft.setCursor(55, 182);
+      tft.println("N");
+      tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+      tft.print("     ");
+    } else {
+      tft.setCursor(55, 182);
+      tft.print(shift);
+      tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+      tft.print("     ");
+    }
+
+    if (mode == 0) {
+      tft.setCursor(55, 252);
+      tft.println("Normal    ");
+    } else {
+      tft.setCursor(55, 252);
+      tft.println("Desportivo");
+    }
+  }
+}
+
+void loop() {
+
+  vTaskDelete(NULL);  //Instrução para apagar a própria tarefa loop()
+}
