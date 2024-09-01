@@ -12,7 +12,7 @@ apresenta no TFT qual o modo de condução em execução.
 O potenciómetro altera o valor de PWM que acende os LEDS e alimenta o motor DC.
 Porém, a rotação do motor DC é lida pelo sensor LM393 e posteriormente 
 o seu valor é enviado para ser apresentado no TFT.
-LINKs: GitHub: 
+LINKs: GitHub: https://github.com/Rocha73/ShiftLight/blob/main/Code
        Youtube:  
 */-------------------------------------
 #include "Arduino.h"
