@@ -59,7 +59,6 @@ void Leds(void *pvParameters);
 void Int_Contador(void);
 //Declaração variável do semáfero:
 SemaphoreHandle_t xCountingSemaphore;
-SemaphoreHandle_t xMutex;
 
 //Declaração de variáveis de Queues:
 QueueHandle_t xQueueRPM;
@@ -94,9 +93,6 @@ void setup() {
 
   //Criação semáfero contador:
   xCountingSemaphore = xSemaphoreCreateCounting(4000, 0);
-
-  //Criação Mutex:
-  xMutex = xSemaphoreCreateMutex();
 
   //Criação das tarefas:
   if (xCountingSemaphore != NULL) {
